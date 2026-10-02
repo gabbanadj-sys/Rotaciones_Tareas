@@ -239,6 +239,12 @@
   .task-row{ display:flex;align-items:center;gap:10px; background:var(--card); border:1px solid var(--line); border-radius:11px; padding:10px 12px; margin-bottom:8px; }
   .task-row .dot{ width:14px;height:14px;border-radius:4px;flex-shrink:0;cursor:pointer; }
   .task-row .tname{ flex:1;font-size:13.5px;font-weight:600; }
+  .letter-group{ margin-bottom:6px; }
+  .letter-header{
+    font-family:'IBM Plex Mono',monospace; font-size:11px; font-weight:700; color:var(--accent-dark);
+    background:var(--accent-soft); padding:3px 10px; border-radius:5px; display:inline-block;
+    margin:10px 0 6px;
+  }
   .task-row .break-badge{ font-family:'IBM Plex Mono',monospace; font-size:9px; color:var(--muted); border:1px solid var(--line); padding:2px 6px; border-radius:4px; }
   .icon-btn{ background:none;border:none;cursor:pointer; color:var(--muted);font-size:15px;padding:3px 5px; }
   .icon-btn:hover{ color:var(--red); }
@@ -348,21 +354,34 @@ const NON_WORK_TASK_NAMES = ['entrada','desplazamiento','comida','descanso','sal
 function isNonWorkTaskName(name){
   return NON_WORK_TASK_NAMES.includes(name.trim().toLowerCase());
 }
-// For the daily-jornada / horas-extra calculation specifically: Entrada,
-// Desplazamiento and Descanso DO count towards completing the 7,25h
-// standard workday. Only Comida and Salida are left out — Comida because
-// it simply doesn't count either way (it neither fulfills nor extends the
-// jornada), and Salida because it's just the closing checkpoint.
-const JORNADA_EXCLUDED_NAMES = ['comida','salida'];
-function isJornadaExcludedTaskName(name){
-  return JORNADA_EXCLUDED_NAMES.includes(name.trim().toLowerCase());
+// Jornada / horas-extra calculation: rather than summing individual task
+// durations, we take the full presence span for the day — from the
+// earliest logged start to the latest logged end (Entrada to Salida, in
+// effect) — and subtract one fixed, configurable break (45 min by
+// default). This way Entrada, Desplazamiento, Descanso and any gaps in
+// between all naturally count as part of the jornada, while the lunch
+// break is deducted once per day regardless of whether "Comida" was
+// logged with its own exact duration.
+function getBreakMinutes(){
+  return (state.settings && typeof state.settings.breakMinutes === 'number') ? state.settings.breakMinutes : 45;
 }
-function computeJornadaHours(entriesList){
-  return entriesList.reduce((sum,e)=>{
-    const t = getTask(e.taskId);
-    if(!t || isJornadaExcludedTaskName(t.name)) return sum;
-    return sum + durationHours(e.start,e.end);
-  }, 0);
+function daySpanMinutes(dateStr){
+  const entries = entriesForDate(dateStr);
+  const mins = [];
+  entries.forEach(e=>{ mins.push(timeToMinutes(e.start)); mins.push(timeToMinutes(e.end)); });
+  if(dateStr===todayStr() && state.activeSession){
+    mins.push(timeToMinutes(state.activeSession.startHHMM));
+    const now = new Date();
+    mins.push(now.getHours()*60 + now.getMinutes());
+  }
+  if(mins.length===0) return 0;
+  return Math.max(...mins) - Math.min(...mins);
+}
+function computeJornadaHours(dateStr){
+  const spanMin = daySpanMinutes(dateStr);
+  if(spanMin<=0) return 0;
+  const netMin = Math.max(0, spanMin - getBreakMinutes());
+  return netMin/60;
 }
 // Ensures Entrada/Desplazamiento/Descanso/Comida/Salida exist and are
 // flagged as non-work, even for tasks the user already created by hand
@@ -388,7 +407,7 @@ function buildDefaultState(){
     color: isNonWorkTaskName(name) ? '#94a0b3' : PALETTE[i % PALETTE.length],
     isBreak: isNonWorkTaskName(name)
   }));
-  return ensureNonWorkTasks({ tasks, entries: [], activeSession: null, settings: { dailyStandardHours: 7.25 } });
+  return ensureNonWorkTasks({ tasks, entries: [], activeSession: null, settings: { dailyStandardHours: 7.25, breakMinutes: 45 }, extraUsages: [] });
 }
 
 let state = null;
@@ -459,6 +478,18 @@ async function loadState(){
       if(state.activeSession===undefined) state.activeSession = null;
       if(!state.settings) state.settings = { dailyStandardHours: 7.25 };
       if(typeof state.settings.dailyStandardHours !== 'number') state.settings.dailyStandardHours = 7.25;
+      if(typeof state.settings.breakMinutes !== 'number') state.settings.breakMinutes = 45;
+      if(!state.extraUsages) state.extraUsages = [];
+      if(state.dayAdjustments){
+        // migrate from the older single-adjustment-per-day model
+        Object.keys(state.dayAdjustments).forEach(dateKey=>{
+          const adj = state.dayAdjustments[dateKey];
+          if(adj && adj.hours>0){
+            state.extraUsages.push({ id: makeId(), sourceDate: dateKey, usedDate: dateKey, hours: adj.hours, note: adj.note||'' });
+          }
+        });
+        delete state.dayAdjustments;
+      }
       ensureNonWorkTasks(state);
       await silentPersist();
     }catch(e){
@@ -746,14 +777,27 @@ function renderContent(){
 
 /* ---- HOY ---- */
 function computeLiveWorkedHours(dateStr){
-  let hours = computeJornadaHours(entriesForDate(dateStr));
-  if(dateStr===todayStr() && state.activeSession){
-    const task = getTask(state.activeSession.taskId);
-    if(task && !isJornadaExcludedTaskName(task.name)){
-      hours += (Date.now() - state.activeSession.startEpochMs)/3600000;
-    }
-  }
-  return hours;
+  return computeJornadaHours(dateStr);
+}
+function usagesForSource(sourceDate){
+  return state.extraUsages.filter(u=>u.sourceDate===sourceDate);
+}
+function totalSpentFromSource(sourceDate){
+  return usagesForSource(sourceDate).reduce((s,u)=>s+u.hours, 0);
+}
+function addExtraUsage(sourceDate, usedDate, hours, note){
+  state.extraUsages.push({ id: makeId(), sourceDate, usedDate, hours, note: note||'' });
+}
+function deleteExtraUsage(id){
+  state.extraUsages = state.extraUsages.filter(u=>u.id!==id);
+}
+// "Horas realizadas" (worked, per the jornada rules) minus whatever has
+// already been used/spent from that day's extra pool (possibly on other
+// days) = the net figure used for the extra-hours calculation.
+function computeNetDayHours(dateStr){
+  const worked = computeLiveWorkedHours(dateStr);
+  const spent = totalSpentFromSource(dateStr);
+  return { worked, spent, net: worked - spent };
 }
 function extraBadgeHtml(diff){
   if(Math.abs(diff) < 0.01) return `<span class="extra-badge neutral">En jornada</span>`;
@@ -762,13 +806,27 @@ function extraBadgeHtml(diff){
 }
 function dayExtraBannerHtml(dateStr){
   const standard = state.settings.dailyStandardHours;
-  const worked = computeLiveWorkedHours(dateStr);
-  const diff = worked - standard;
+  const { worked, spent, net } = computeNetDayHours(dateStr);
+  const diff = net - standard;
   return `<div class="day-extra-banner" id="dayExtraBanner">
       <span class="deb-lbl">Jornada (${fmtHM(standard)})</span>
-      <span class="deb-worked">${fmtHM(worked)}</span>
+      <span class="deb-worked">${fmtHM(net)}${spent>0?` <span style="color:var(--muted);font-weight:400;">(−${fmtHM(spent)} gastadas)</span>`:''}</span>
       ${extraBadgeHtml(diff)}
     </div>`;
+}
+
+function groupedChipGridHtml(chipBuilderFn){
+  const groups = {};
+  sortedTasks().forEach(t=>{
+    const letter = stripAccents((t.name.trim()[0]||'#').toUpperCase());
+    if(!groups[letter]) groups[letter] = [];
+    groups[letter].push(t);
+  });
+  return Object.keys(groups).map(letter=>`
+    <div class="letter-group">
+      <div class="letter-header">${letter}</div>
+      <div class="qa-grid">${groups[letter].map(chipBuilderFn).join('')}</div>
+    </div>`).join('');
 }
 
 function renderHoy(){
@@ -806,11 +864,11 @@ function renderHoy(){
         </div>
         <button class="btn-stop" id="stopSessionBtn">⏹ Detener tarea</button>
         <div class="qa-hint">O cambia directamente a otra tarea</div>
-        <div class="qa-grid" id="qaGrid">
-          ${sortedTasks().map(t=>`
+        <div id="qaGrid">
+          ${groupedChipGridHtml(t=>`
             <button type="button" class="qa-chip ${t.isBreak?'break':''} ${t.id===state.activeSession.taskId?'running':''}" data-quicktask="${t.id}">
               <span class="dot" style="background:${t.color}"></span>${t.name}${t.id===state.activeSession.taskId?' · en curso':''}
-            </button>`).join('')}
+            </button>`)}
         </div>
         <button type="button" class="link-btn" id="manualEntryLink" style="margin-top:12px;">✎ Añadir manualmente en su lugar</button>
       </div>`;
@@ -819,11 +877,11 @@ function renderHoy(){
       <div class="section-head"><h2>Registrar tarea</h2></div>
       <div class="card quickadd">
         <div class="qa-hint" style="margin-top:0;">Toca la tarea que empiezas ahora mismo</div>
-        <div class="qa-grid" id="qaGrid">
-          ${sortedTasks().map(t=>`
+        <div id="qaGrid">
+          ${groupedChipGridHtml(t=>`
             <button type="button" class="qa-chip ${t.isBreak?'break':''}" data-quicktask="${t.id}">
               <span class="dot" style="background:${t.color}"></span>${t.name}
-            </button>`).join('')}
+            </button>`)}
         </div>
         <button type="button" class="link-btn" id="manualEntryLink" style="margin-top:12px;">✎ Añadir manualmente en su lugar</button>
       </div>`;
@@ -922,6 +980,12 @@ function filterEntriesByPeriod(type, dayVal, monthVal, yearVal){
   if(type==='year') return state.entries.filter(e=>e.date.slice(0,4)===yearVal);
   return state.entries.slice();
 }
+function isDateInPeriod(dateStr, type, dayVal, monthVal, yearVal){
+  if(type==='day') return dateStr===dayVal;
+  if(type==='month') return monthKey(dateStr)===monthVal;
+  if(type==='year') return dateStr.slice(0,4)===yearVal;
+  return true;
+}
 function periodLabelText(type, dayVal, monthVal, yearVal){
   if(type==='day') return dateLabel(dayVal).md;
   if(type==='month') return monthLabel(monthVal);
@@ -970,7 +1034,7 @@ function renderHistorial(){
     const dayEntries = entriesForDate(d);
     const dayStats = computeTaskStats(dayEntries);
     const rows = dayEntries.map(e=>logRow(e)).join('');
-    const diff = computeJornadaHours(dayEntries) - state.settings.dailyStandardHours;
+    const diff = computeNetDayHours(d).net - state.settings.dailyStandardHours;
     return `<div class="day-block">
       <div class="day-block-head"><span class="d">${shortDateLabel(d)}</span><span class="h">${fmtHM(dayStats.totalHours)} ${extraBadgeHtml(diff)}</span></div>
       <div class="log-table">${rows}</div>
@@ -1082,14 +1146,20 @@ function renderExtras(){
   const chips = `<div class="month-scroller">${periodTypeChipsHtml('extras', extrasPeriodType)}</div>`;
   const picker = `<div class="card" style="margin-bottom:14px;">${periodPickerFieldHtml('extras', extrasPeriodType, extrasDayValue, extrasMonthValue, extrasYearValue)}</div>`;
 
+  const breakMin = getBreakMinutes();
   const standardSetting = `
     <div class="card" style="margin-bottom:18px;">
       <label class="field-label">Jornada diaria estándar</label>
-      <div style="display:flex;align-items:center;gap:10px;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
         <input type="number" id="dailyStandardInput" step="0.25" min="0" max="24" value="${standard}" style="width:100px;">
         <span style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--muted);">horas / día (${fmtHM(standard)})</span>
       </div>
-      <div class="section-note" style="margin-top:10px;">Para este cálculo, Entrada, Desplazamiento y Descanso sí cuentan como parte de la jornada. Comida y Salida no suman ni restan.</div>
+      <label class="field-label">Pausa de comida no contabilizada</label>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <input type="number" id="breakMinutesInput" step="5" min="0" max="180" value="${breakMin}" style="width:100px;">
+        <span style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--muted);">minutos</span>
+      </div>
+      <div class="section-note" style="margin-top:10px;">Las horas extra se calculan desde tu primer fichaje hasta el último de ese día, restando siempre esta pausa — da igual que anotes "Comida" con su propia duración o no.</div>
     </div>`;
 
   const filtered = filterEntriesByPeriod(extrasPeriodType, extrasDayValue, extrasMonthValue, extrasYearValue);
@@ -1101,51 +1171,276 @@ function renderExtras(){
 
   let totalExtra=0, totalDeficit=0, daysOver=0, daysUnder=0, daysOnTarget=0;
   const dayRows = dates.map(d=>{
-    const dayHours = computeJornadaHours(entriesForDate(d));
-    const diff = dayHours - standard;
-    if(diff > 0.01){ totalExtra += diff; daysOver++; }
-    else if(diff < -0.01){ totalDeficit += -diff; daysUnder++; }
+    const worked = computeLiveWorkedHours(d);
+    const spent = totalSpentFromSource(d);
+    const rawDiff = worked - standard; // gross extra/deficit that day actually generated
+    const remaining = rawDiff - spent;
+    if(rawDiff > 0.01){ totalExtra += rawDiff; daysOver++; }
+    else if(rawDiff < -0.01){ totalDeficit += -rawDiff; daysUnder++; }
     else { daysOnTarget++; }
-    return { date:d, hours:dayHours, diff };
+    return { date:d, worked, spent, rawDiff, remaining };
   });
 
   const kpiGrid = `<div class="stats-kpi-grid">
       <div class="stats-kpi-card">
         <div class="lbl">Horas extra</div>
-        <div class="val" style="color:var(--green);">+${fmtHoursDec(totalExtra)}h</div>
+        <div class="val" style="color:var(--green);">+${fmtHM(totalExtra)}</div>
         <div class="kpi-delta neutral">${daysOver} día${daysOver===1?'':'s'} con exceso</div>
       </div>
       <div class="stats-kpi-card">
         <div class="lbl">Horas de menos</div>
-        <div class="val" style="color:${totalDeficit>0?'var(--red)':'var(--ink)'};">${totalDeficit>0?'-':''}${fmtHoursDec(totalDeficit)}h</div>
+        <div class="val" style="color:${totalDeficit>0?'var(--red)':'var(--ink)'};">${totalDeficit>0?'-':''}${fmtHM(totalDeficit)}</div>
         <div class="kpi-delta neutral">${daysUnder} día${daysUnder===1?'':'s'} por debajo</div>
       </div>
-      <div class="stats-kpi-card">
-        <div class="lbl">Balance neto</div>
-        <div class="val" style="color:${(totalExtra-totalDeficit)>=0?'var(--green)':'var(--red)'};">${(totalExtra-totalDeficit)>=0?'+':''}${fmtHoursDec(totalExtra-totalDeficit)}h</div>
-        <div class="kpi-delta neutral">extra menos déficit</div>
-      </div>
-      <div class="stats-kpi-card">
+      <div class="stats-kpi-card" style="grid-column:1 / -1;">
         <div class="lbl">Días en jornada</div>
         <div class="val">${daysOnTarget}</div>
         <div class="kpi-delta neutral">de ${dates.length} días trabajados</div>
       </div>
     </div>`;
 
-  const rows = dayRows.map(r=>{
-    const badgeColor = r.diff>0.01 ? 'var(--green)' : (r.diff<-0.01 ? 'var(--red)' : 'var(--muted)');
-    const badgeText = r.diff>0.01 ? '+'+fmtHM(r.diff) : (r.diff<-0.01 ? '-'+fmtHM(-r.diff) : 'En jornada');
+  const rows = dayRows.filter(r=>r.rawDiff>0.01).map(r=>{
+    const fullySpent = r.remaining <= 0.01;
+    const extraColor = fullySpent ? 'var(--muted)' : 'var(--green)';
+    const extraText = fullySpent ? 'Gastada' : ('+'+fmtHM(r.remaining));
+    const spentLine = r.spent>0 ? `<div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted);margin-top:2px;">-${fmtHM(r.spent)} gastadas</div>` : '';
     return `
-      <div class="log-row" style="grid-template-columns:1fr 70px 90px;cursor:default;">
-        <div class="log-task"><span class="name">${shortDateLabel(r.date)}</span></div>
-        <div class="log-dur">${fmtHM(r.hours)}</div>
-        <div style="text-align:right;font-family:'IBM Plex Mono',monospace;font-size:12px;font-weight:700;color:${badgeColor};">${badgeText}</div>
+      <div class="log-row" data-daydetail="${r.date}" style="grid-template-columns:1fr 70px 90px 18px;">
+        <div class="log-task" style="flex-direction:column;align-items:flex-start;gap:0;">
+          <span class="name">${shortDateLabel(r.date)}</span>${spentLine}
+        </div>
+        <div class="log-dur">${fmtHM(r.worked)}</div>
+        <div style="text-align:right;font-family:'IBM Plex Mono',monospace;font-size:12px;font-weight:700;color:${extraColor};">${extraText}</div>
+        <div class="log-chevron">›</div>
       </div>`;
   }).join('');
+  const extraDaysCount = dayRows.filter(r=>r.rawDiff>0.01).length;
+
+  const breakdownBody = extraDaysCount>0
+    ? `<div class="log-table"><div class="log-head" style="grid-template-columns:1fr 70px 90px 18px;"><div>Día</div><div>Horas</div><div style="text-align:right">Extra</div><div></div></div>${rows}</div>`
+    : `<div class="empty-state"><div class="big">Ningún día con horas extra</div>En este periodo no hay jornadas por encima de ${fmtHM(standard)}.</div>`;
+
+  // Days on which extra hours were actually spent (usedDate), within the selected period
+  const usagesInPeriod = state.extraUsages.filter(u=>isDateInPeriod(u.usedDate, extrasPeriodType, extrasDayValue, extrasMonthValue, extrasYearValue));
+  const spentByUsedDate = {};
+  usagesInPeriod.forEach(u=>{
+    if(!spentByUsedDate[u.usedDate]) spentByUsedDate[u.usedDate] = { total:0, items:[] };
+    spentByUsedDate[u.usedDate].total += u.hours;
+    spentByUsedDate[u.usedDate].items.push(u);
+  });
+  const spentDates = Object.keys(spentByUsedDate).sort((a,b)=>b.localeCompare(a));
+  const spentSectionHtml = spentDates.length===0 ? '' : (
+    `<div class="section-head"><h2>Días en que gastaste horas extra <span class="num">${spentDates.length}</span></h2></div>`
+    + `<div class="section-note" style="margin-bottom:10px;">Toca un día para ver o quitar los gastos anotados ahí.</div>`
+    + `<div class="log-table" style="margin-bottom:6px;">${spentDates.map(d=>{
+        const info = spentByUsedDate[d];
+        const sources = [...new Set(info.items.map(u=>u.sourceDate))];
+        const sourcesLabel = sources.length===1 ? `de ${shortDateLabel(sources[0])}` : `de ${sources.length} días distintos`;
+        return `
+          <div class="log-row" data-spentdaydetail="${d}" style="grid-template-columns:1fr 90px 18px;">
+            <div class="log-task" style="flex-direction:column;align-items:flex-start;gap:0;">
+              <span class="name">${shortDateLabel(d)}</span>
+              <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted);margin-top:2px;">${sourcesLabel}</div>
+            </div>
+            <div style="text-align:right;font-family:'IBM Plex Mono',monospace;font-size:12px;font-weight:700;color:var(--red);">-${fmtHM(info.total)}</div>
+            <div class="log-chevron">›</div>
+          </div>`;
+      }).join('')}</div>`
+  );
 
   return chips + picker + standardSetting + kpiGrid
-    + `<div class="section-head"><h2>Desglose por día <span class="num">${dates.length}</span></h2></div>`
-    + `<div class="log-table"><div class="log-head" style="grid-template-columns:1fr 70px 90px;"><div>Día</div><div>Horas</div><div style="text-align:right">Extra</div></div>${rows}</div>`;
+    + `<div class="section-head"><h2>Desglose por día <span class="num">${extraDaysCount}</span></h2></div>`
+    + (extraDaysCount>0 ? `<div class="section-note" style="margin-bottom:10px;">Solo se listan los días que generaron horas extra. Toca uno para gastarlas o ver qué queda.</div>` : '')
+    + breakdownBody
+    + spentSectionHtml;
+}
+
+/* ---- day-detail sheet: edit/delete entries and log "horas gastadas" for a single day ---- */
+/* ---- sheet: usages consumed on a given "used" day (across possibly several source days) ---- */
+function openSpentDaySheet(usedDate){
+  const overlay = document.getElementById('sheetOverlay');
+  const content = document.getElementById('sheetContent');
+  const { wd, md } = dateLabel(usedDate);
+
+  function draw(){
+    const usages = state.extraUsages.filter(u=>u.usedDate===usedDate);
+    const total = usages.reduce((s,u)=>s+u.hours,0);
+    const rows = usages.length===0
+      ? `<div class="section-note" style="margin-bottom:14px;">No queda ningún gasto anotado en este día.</div>`
+      : `<div class="log-table" style="margin-bottom:14px;">${usages.map(u=>`
+          <div class="log-row" style="grid-template-columns:1fr 70px 26px;cursor:default;">
+            <div class="log-task"><span class="name">De ${shortDateLabel(u.sourceDate)}${u.note?' · '+u.note:''}</span></div>
+            <div class="log-dur">-${fmtHM(u.hours)}</div>
+            <button class="icon-btn" data-delusage2="${u.id}">✕</button>
+          </div>`).join('')}</div>`;
+    content.innerHTML = `
+      <div class="sheet-handle"></div>
+      <h3>${wd.charAt(0).toUpperCase()+wd.slice(1)}, ${md}</h3>
+      <div class="card" style="margin-bottom:16px;display:flex;justify-content:space-between;align-items:center;">
+        <span style="font-size:12.5px;color:var(--muted);">Total gastado ese día</span>
+        <strong style="font-family:'IBM Plex Mono',monospace;color:var(--red);">-${fmtHM(total)}</strong>
+      </div>
+      ${rows}
+      <div class="sheet-actions">
+        <button class="btn-secondary" id="closeSpentSheetBtn" style="flex:1;">Cerrar</button>
+      </div>
+    `;
+    content.querySelectorAll('[data-delusage2]').forEach(el=>{
+      el.addEventListener('click', ()=>{
+        deleteExtraUsage(el.dataset.delusage2);
+        scheduleSave();
+        draw();
+        renderContent();
+        showToast('Gasto eliminado');
+      });
+    });
+    document.getElementById('closeSpentSheetBtn').addEventListener('click', ()=>{
+      closeSheet();
+      renderContent();
+    });
+  }
+  draw();
+  overlay.classList.add('open');
+}
+
+function openDayDetailSheet(sourceDate){
+  const overlay = document.getElementById('sheetOverlay');
+  const content = document.getElementById('sheetContent');
+  const standard = state.settings.dailyStandardHours;
+  const { wd, md } = dateLabel(sourceDate);
+
+  function rawExtraFor(d){
+    return computeLiveWorkedHours(d) - standard;
+  }
+
+  function figuresHtml(){
+    const rawExtra = rawExtraFor(sourceDate);
+    const spent = totalSpentFromSource(sourceDate);
+    const remaining = rawExtra - spent;
+    return `
+      <div class="card" style="margin-bottom:16px;">
+        <div style="display:flex;justify-content:space-between;font-size:12.5px;color:var(--muted);margin-bottom:4px;"><span>Horas extra ganadas ese día</span><strong style="color:${rawExtra>=0?'var(--green)':'var(--red)'};font-family:'IBM Plex Mono',monospace;">${rawExtra>=0?'+':'-'}${fmtHM(Math.abs(rawExtra))}</strong></div>
+        <div style="display:flex;justify-content:space-between;font-size:12.5px;color:var(--muted);margin-bottom:4px;"><span>Ya gastadas</span><strong id="dayAdjSpentDisplay" style="color:var(--ink);font-family:'IBM Plex Mono',monospace;">-${fmtHM(spent)}</strong></div>
+        <div style="display:flex;justify-content:space-between;font-size:13px;font-weight:700;border-top:1px solid var(--line);margin-top:6px;padding-top:6px;">
+          <span>Extra restante</span>
+          <span id="dayAdjRemainingDisplay" style="font-family:'IBM Plex Mono',monospace;color:${remaining>=0?'var(--green)':'var(--red)'};">${remaining>=0?'+':'-'}${fmtHM(Math.abs(remaining))}</span>
+        </div>
+      </div>`;
+  }
+
+  function entriesListHtml(){
+    const entries = entriesForDate(sourceDate);
+    if(entries.length===0) return `<div class="section-note" style="margin-bottom:14px;">Sin registros ese día.</div>`;
+    return `<div class="log-table" style="margin-bottom:16px;">${entries.map(e=>logRow(e)).join('')}</div>`;
+  }
+
+  function usagesListHtml(){
+    const usages = usagesForSource(sourceDate);
+    if(usages.length===0) return `<div class="section-note" style="margin-bottom:12px;">Aún no has gastado nada de este día.</div>`;
+    return `<div class="log-table" style="margin-bottom:12px;">${usages.map(u=>`
+      <div class="log-row" style="grid-template-columns:1fr 70px 26px;cursor:default;">
+        <div class="log-task"><span class="name">${shortDateLabel(u.usedDate)}${u.note?' · '+u.note:''}</span></div>
+        <div class="log-dur">-${fmtHM(u.hours)}</div>
+        <button class="icon-btn" data-delusage="${u.id}" style="text-align:right;">✕</button>
+      </div>`).join('')}</div>`;
+  }
+
+  function draw(){
+    content.innerHTML = `
+      <div class="sheet-handle"></div>
+      <h3>${wd.charAt(0).toUpperCase()+wd.slice(1)}, ${md}</h3>
+      ${figuresHtml()}
+      <div class="section-head" style="margin-top:0;"><h2>Registros de ese día</h2></div>
+      ${entriesListHtml()}
+      <div class="section-head"><h2>Horas ya gastadas de este día</h2></div>
+      ${usagesListHtml()}
+      <div class="card" style="margin-bottom:18px;">
+        <label class="field-label">Añadir un gasto de estas horas extra</label>
+        <div class="form-field" style="margin-bottom:10px;margin-top:8px;">
+          <span style="font-family:'IBM Plex Mono',monospace;font-size:9.5px;color:var(--muted);display:block;margin-bottom:3px;">DÍA EN QUE LAS GASTAS</span>
+          <input type="date" id="usageDateInput" value="${todayStr()}">
+        </div>
+        <div class="form-field" style="margin-bottom:10px;">
+          <div class="form-grid" style="grid-template-columns:1fr 1fr;margin-bottom:0;">
+            <div>
+              <span style="font-family:'IBM Plex Mono',monospace;font-size:9.5px;color:var(--muted);display:block;margin-bottom:3px;">HORAS</span>
+              <input type="number" id="usageHoursInput" step="1" min="0" value="0">
+            </div>
+            <div>
+              <span style="font-family:'IBM Plex Mono',monospace;font-size:9.5px;color:var(--muted);display:block;margin-bottom:3px;">MINUTOS</span>
+              <input type="number" id="usageMinutesInput" step="1" min="0" max="59" value="0">
+            </div>
+          </div>
+        </div>
+        <div class="form-field" style="margin-bottom:10px;">
+          <span style="font-family:'IBM Plex Mono',monospace;font-size:9.5px;color:var(--muted);display:block;margin-bottom:3px;">OBSERVACIÓN (OPCIONAL)</span>
+          <input type="text" id="usageNoteInput" placeholder="Ej. cita médica, gestión personal…">
+        </div>
+        <button class="btn-primary" id="addUsageBtn" style="width:100%;">➕ Añadir gasto</button>
+      </div>
+      <div class="sheet-actions">
+        <button class="btn-danger" id="deleteDayBtn">🗑 Borrar día</button>
+        <button class="btn-secondary" id="closeDaySheetBtn" style="flex:1;">Cerrar</button>
+      </div>
+    `;
+    function updateRemainingDisplay(){
+      const h = parseInt(document.getElementById('usageHoursInput').value, 10) || 0;
+      const m = parseInt(document.getElementById('usageMinutesInput').value, 10) || 0;
+      const pending = h + (m/60);
+      const rawExtra = rawExtraFor(sourceDate);
+      const alreadySpent = totalSpentFromSource(sourceDate);
+      const remaining = rawExtra - alreadySpent - pending;
+      const remEl = document.getElementById('dayAdjRemainingDisplay');
+      remEl.textContent = (remaining>=0?'+':'-')+fmtHM(Math.abs(remaining));
+      remEl.style.color = remaining>=0 ? 'var(--green)' : 'var(--red)';
+    }
+    document.getElementById('usageHoursInput').addEventListener('input', updateRemainingDisplay);
+    document.getElementById('usageMinutesInput').addEventListener('input', updateRemainingDisplay);
+    content.querySelectorAll('[data-edit]').forEach(el=>{
+      el.addEventListener('click', ()=>{
+        const entry = state.entries.find(x=>x.id===el.dataset.edit);
+        if(entry) openEntrySheet(entry);
+      });
+    });
+    content.querySelectorAll('[data-delusage]').forEach(el=>{
+      el.addEventListener('click', ()=>{
+        deleteExtraUsage(el.dataset.delusage);
+        scheduleSave();
+        draw();
+        showToast('Gasto eliminado');
+      });
+    });
+    document.getElementById('addUsageBtn').addEventListener('click', ()=>{
+      const usedDate = document.getElementById('usageDateInput').value || todayStr();
+      const h = parseInt(document.getElementById('usageHoursInput').value, 10) || 0;
+      const m = parseInt(document.getElementById('usageMinutesInput').value, 10) || 0;
+      const hours = h + (m/60);
+      const note = document.getElementById('usageNoteInput').value.trim();
+      if(hours<=0){ showToast('Indica cuántas horas gastas'); return; }
+      addExtraUsage(sourceDate, usedDate, hours, note);
+      scheduleSave();
+      draw();
+      renderContent();
+      showToast('Gasto añadido');
+    });
+    document.getElementById('closeDaySheetBtn').addEventListener('click', ()=>{
+      closeSheet();
+      renderContent();
+    });
+    document.getElementById('deleteDayBtn').addEventListener('click', ()=>{
+      const count = entriesForDate(sourceDate).length;
+      if(count===0){ showToast('Este día no tiene registros'); return; }
+      if(!confirm(`¿Eliminar los ${count} registro(s) de ${shortDateLabel(sourceDate)}? También se borrarán los gastos asociados a este día. Esta acción no se puede deshacer.`)) return;
+      state.entries = state.entries.filter(e=>e.date!==sourceDate);
+      state.extraUsages = state.extraUsages.filter(u=>u.sourceDate!==sourceDate);
+      scheduleSave();
+      closeSheet();
+      renderContent();
+      showToast('Día eliminado');
+    });
+  }
+  draw();
+  overlay.classList.add('open');
 }
 
 /* ---- INFORMES (print / share) ---- */
@@ -1269,18 +1564,33 @@ function buildPrintHTML(){
 }
 
 /* ---- TAREAS ---- */
-function renderTareas(){
-  const rows = sortedTasks().map(t=>`
+function stripAccents(s){ return s.normalize('NFD').replace(/[\u0300-\u036f]/g,''); }
+function taskRowHtml(t){
+  return `
     <div class="task-row">
       <div class="dot" data-recolor="${t.id}" style="background:${t.color}"></div>
       <div class="tname">${t.name}</div>
       ${t.isBreak ? '<span class="break-badge">NO CUENTA</span>' : ''}
       <button class="icon-btn" data-deltask="${t.id}">✕</button>
+    </div>`;
+}
+function renderTareas(){
+  const groups = {};
+  sortedTasks().forEach(t=>{
+    const letter = stripAccents((t.name.trim()[0]||'#').toUpperCase());
+    if(!groups[letter]) groups[letter] = [];
+    groups[letter].push(t);
+  });
+  const rows = Object.keys(groups).map(letter=>`
+    <div class="letter-group">
+      <div class="letter-header">${letter}</div>
+      ${groups[letter].map(taskRowHtml).join('')}
     </div>`).join('');
 
   const resetChips = periodTypeChipsHtml('reset', resetPeriodType);
   const resetPicker = periodPickerFieldHtml('reset', resetPeriodType, resetDayValue, resetMonthValue, resetYearValue);
   const toDeleteCount = filterEntriesByPeriod(resetPeriodType, resetDayValue, resetMonthValue, resetYearValue).length;
+  const usagesCount = state.extraUsages.length;
 
   return `
     <div class="section-head"><h2>Tus tareas <span class="num">${state.tasks.length}</span></h2></div>
@@ -1293,7 +1603,10 @@ function renderTareas(){
     <div class="section-note" style="margin-bottom:12px;">Borra los registros de un día, un mes, un año concreto — o todos. Para eliminar un único registro suelto, tócalo en "Hoy" o "Historial" y usa "Eliminar" ahí.</div>
     <div class="month-scroller">${resetChips}</div>
     <div class="card" style="margin-bottom:14px;">${resetPicker}</div>
-    <button class="btn-danger" id="resetPeriodBtn" style="width:100%;">🗑 Eliminar ${toDeleteCount} registro${toDeleteCount===1?'':'s'} de este periodo</button>
+    <button class="btn-danger" id="resetPeriodBtn" style="width:100%;margin-bottom:22px;">🗑 Eliminar ${toDeleteCount} registro${toDeleteCount===1?'':'s'} de este periodo</button>
+    <div class="section-head"><h2>Horas extra</h2></div>
+    <div class="section-note" style="margin-bottom:12px;">Borra todos los gastos de horas extra anotados (lo ganado ese día no se ve afectado, vuelve a estar disponible). Para borrar solo uno, hazlo desde su día en la pestaña Extras.</div>
+    <button class="btn-danger" id="clearExtraUsagesBtn" style="width:100%;">🗑 Borrar todas las horas extra gastadas (${usagesCount})</button>
   `;
 }
 
@@ -1342,6 +1655,12 @@ function attachContentHandlers(){
       if(entry) openEntrySheet(entry);
     });
   });
+  document.querySelectorAll('[data-daydetail]').forEach(el=>{
+    el.addEventListener('click', ()=> openDayDetailSheet(el.dataset.daydetail));
+  });
+  document.querySelectorAll('[data-spentdaydetail]').forEach(el=>{
+    el.addEventListener('click', ()=> openSpentDaySheet(el.dataset.spentdaydetail));
+  });
 
   document.querySelectorAll('[data-historialtype]').forEach(el=>{
     el.addEventListener('click', ()=>{ historialPeriodType = el.dataset.historialtype; renderContent(); });
@@ -1366,6 +1685,11 @@ function attachContentHandlers(){
   document.getElementById('dailyStandardInput')?.addEventListener('change', (e)=>{
     const v = parseFloat(e.target.value);
     if(!isNaN(v) && v>=0){ state.settings.dailyStandardHours = v; scheduleSave(); }
+    renderContent();
+  });
+  document.getElementById('breakMinutesInput')?.addEventListener('change', (e)=>{
+    const v = parseInt(e.target.value, 10);
+    if(!isNaN(v) && v>=0){ state.settings.breakMinutes = v; scheduleSave(); }
     renderContent();
   });
 
@@ -1452,6 +1776,14 @@ function attachContentHandlers(){
     await persist();
     render();
     showToast(toDeleteIds.length+' registro(s) eliminados');
+  });
+  document.getElementById('clearExtraUsagesBtn')?.addEventListener('click', async ()=>{
+    if(state.extraUsages.length===0){ showToast('No hay gastos de horas extra que borrar'); return; }
+    if(!confirm(`¿Borrar los ${state.extraUsages.length} gastos de horas extra anotados? Esto no borra tus registros de tareas, solo el historial de horas ya gastadas.`)) return;
+    state.extraUsages = [];
+    await persist();
+    renderContent();
+    showToast('Horas extra gastadas borradas');
   });
 }
 
