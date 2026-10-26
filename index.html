@@ -212,6 +212,8 @@
   .stat-row{ background:var(--card); border:1px solid var(--line); border-radius:11px; padding:11px 13px; margin-bottom:8px; }
   .stat-row .top{ display:flex;justify-content:space-between;align-items:center; margin-bottom:7px; }
   .stat-row .name{ font-weight:600;font-size:13.5px; display:flex;align-items:center;gap:8px; }
+  .stat-row-tap{ cursor:pointer; }
+  .stat-row-tap:active{ background:#fafbfc; }
   .rank-badge{
     width:19px;height:19px; border-radius:5px; background:var(--paper); border:1px solid var(--line);
     display:flex; align-items:center; justify-content:center; font-family:'IBM Plex Mono',monospace;
@@ -415,6 +417,7 @@ function removeHoliday(dateStr){
 // between all naturally count as part of the jornada, while the lunch
 // break is deducted once per day regardless of whether "Comida" was
 // logged with its own exact duration.
+const FESTIVE_BREAK_THRESHOLD_MIN = 6*60;
 function getBreakMinutes(){
   return (state.settings && typeof state.settings.breakMinutes === 'number') ? state.settings.breakMinutes : 45;
 }
@@ -433,8 +436,9 @@ function daySpanMinutes(dateStr){
 function computeJornadaHours(dateStr){
   const spanMin = daySpanMinutes(dateStr);
   if(spanMin<=0) return 0;
-  // On a festivo nothing is deducted: the whole span counts as extra festiva.
-  const breakMin = isHoliday(dateStr) ? 0 : getBreakMinutes();
+  // On a festivo the break only counts (nothing is deducted) when the span
+  // goes beyond 6 hours; on a shorter festive shift the usual break is deducted.
+  const breakMin = (isHoliday(dateStr) && spanMin > FESTIVE_BREAK_THRESHOLD_MIN) ? 0 : getBreakMinutes();
   const netMin = Math.max(0, spanMin - breakMin);
   return netMin/60;
 }
@@ -844,9 +848,15 @@ function usagesForSource(sourceDate){
 function totalSpentFromSource(sourceDate){
   return usagesForSource(sourceDate).reduce((s,u)=>s+u.hours, 0);
 }
-function addExtraUsage(sourceDate, usedDate, hours, note){
-  state.extraUsages.push({ id: makeId(), sourceDate, usedDate, hours, note: note||'' });
+// 1 festive hour is worth 4 normal hours when swapped for time off.
+const FESTIVE_EQUIVALENCE = 4;
+// `hours` = what is taken out of the source day's extra pool;
+// `enjoyed` = the time off actually taken (hours x factor); factor 1 or 4.
+function addExtraUsage(sourceDate, usedDate, hours, note, enjoyed, factor){
+  state.extraUsages.push({ id: makeId(), sourceDate, usedDate, hours, note: note||'',
+    enjoyed: (enjoyed===undefined ? hours : enjoyed), factor: factor||1 });
 }
+function usageEnjoyed(u){ return (typeof u.enjoyed === 'number') ? u.enjoyed : u.hours; }
 function deleteExtraUsage(id){
   state.extraUsages = state.extraUsages.filter(u=>u.id!==id);
 }
@@ -1193,10 +1203,10 @@ function renderStats(){
     </div>`;
 
   const rankingRows = stats.rows.map((r,i)=>`
-      <div class="stat-row">
+      <div class="stat-row stat-row-tap" data-taskdetail="${r.task.id}">
         <div class="top">
           <div class="name"><span class="rank-badge">${i+1}</span><span class="dot" style="background:${r.task.color}"></span>${r.task.name}</div>
-          <div class="figures"><b>${r.count}×</b> · <b>${fmtHoursDec(r.hours)}h</b> · <b>${r.pct.toFixed(1)}%</b></div>
+          <div class="figures"><b>${r.count}×</b> · <b>${fmtHoursDec(r.hours)}h</b> · <b>${r.pct.toFixed(1)}%</b> <span style="color:var(--line);">›</span></div>
         </div>
         <div class="bar-bg"><div class="bar-fill" style="width:${r.pct}%;background:${r.task.color}"></div></div>
       </div>`).join('');
@@ -1206,6 +1216,7 @@ function renderStats(){
     + kpiGrid
     + summaryCardHtml(stats, label)
     + `<div class="section-head"><h2>Clasificación de tareas <span class="num">${stats.rows.length}</span></h2></div>`
+    + `<div class="section-note" style="margin-bottom:10px;">Toca una tarea para ver los días en que la realizaste.</div>`
     + rankingRows;
 }
 
@@ -1223,7 +1234,7 @@ function festivosManagerHtml(year){
   const defaultDate = todayStr().slice(0,4)===String(year) ? todayStr() : year+'-01-01';
   return `<details class="card fest-details" id="festivosDetails" ${festivosOpen?'open':''} style="margin-bottom:18px;">
       <summary>🎉 Festivos ${year} <span class="num-pill">${list.length}</span></summary>
-      <div class="section-note" style="margin:10px 0 12px;">Calendario laboral de A Coruña. En un día festivo no hay jornada estándar ni se descuenta la pausa: todo el tiempo trabajado ese día cuenta como extra festiva.</div>
+      <div class="section-note" style="margin:10px 0 12px;">Calendario laboral de A Coruña. En un día festivo no hay jornada estándar: todo lo trabajado cuenta como extra. La pausa de comida también cuenta si pasas de 6 horas; si no, se descuenta.</div>
       ${list.length ? `<div class="log-table" style="margin-bottom:14px;">${rows}</div>` : `<div class="section-note" style="margin-bottom:14px;">No hay festivos anotados en este año.</div>`}
       <label class="field-label">Añadir festivo a mano</label>
       <div class="form-field" style="margin-bottom:8px;"><input type="date" id="newHolidayDate" value="${defaultDate}"></div>
@@ -1333,7 +1344,7 @@ function renderExtras(){
   const spentByUsedDate = {};
   usagesInPeriod.forEach(u=>{
     if(!spentByUsedDate[u.usedDate]) spentByUsedDate[u.usedDate] = { total:0, items:[] };
-    spentByUsedDate[u.usedDate].total += u.hours;
+    spentByUsedDate[u.usedDate].total += usageEnjoyed(u);
     spentByUsedDate[u.usedDate].items.push(u);
   });
   const spentDates = Object.keys(spentByUsedDate).sort((a,b)=>b.localeCompare(a));
@@ -1364,6 +1375,59 @@ function renderExtras(){
 }
 
 /* ---- day-detail sheet: edit/delete entries and log "horas gastadas" for a single day ---- */
+/* ---- sheet: days on which a given task was done (within the Estadísticas period) ---- */
+function openTaskDaysSheet(taskId){
+  const overlay = document.getElementById('sheetOverlay');
+  const content = document.getElementById('sheetContent');
+  const task = getTask(taskId);
+  if(!task) return;
+  const label = periodLabelText(statsPeriodType, statsDayValue, statsMonthValue, statsYearValue);
+  const entries = filterEntriesByPeriod(statsPeriodType, statsDayValue, statsMonthValue, statsYearValue)
+    .filter(e=>e.taskId===taskId)
+    .sort((a,b)=> a.date===b.date ? timeToMinutes(a.start)-timeToMinutes(b.start) : b.date.localeCompare(a.date));
+  const byDay = {};
+  entries.forEach(e=>{
+    if(!byDay[e.date]) byDay[e.date] = { hours:0, items:[] };
+    byDay[e.date].hours += durationHours(e.start,e.end);
+    byDay[e.date].items.push(e);
+  });
+  const days = Object.keys(byDay).sort((a,b)=>b.localeCompare(a));
+  const totalHours = entries.reduce((s,e)=>s+durationHours(e.start,e.end),0);
+  const dayBlockHtml = d => `
+      <div class="day-block" style="margin-bottom:12px;">
+        <div class="day-block-head"><span class="d">${isHoliday(d)?'🎉 ':''}${shortDateLabel(d)}</span><span class="h">${fmtHM(byDay[d].hours)}</span></div>
+        <div class="log-table">${byDay[d].items.map(e=>`
+          <div class="log-row" style="grid-template-columns:1fr 70px;cursor:default;">
+            <div class="log-time" style="font-size:12px;">${e.start} – ${e.end}</div>
+            <div class="log-dur">${fmtHM(durationHours(e.start,e.end))}</div>
+          </div>`).join('')}</div>
+      </div>`;
+  // Group the days by month so it is clear which days of each month the task was done
+  const months = [...new Set(days.map(d=>monthKey(d)))];
+  const body = days.length===0
+    ? `<div class="section-note">No hay registros de esta tarea en este periodo.</div>`
+    : months.map(m=>{
+        const mDays = days.filter(d=>monthKey(d)===m);
+        const mHours = mDays.reduce((sum,d)=>sum+byDay[d].hours,0);
+        const dayNums = mDays.slice().sort().map(d=>parseInt(d.slice(8),10)).join(', ');
+        return `<div class="section-head" style="margin:6px 0 6px;"><h2>${monthLabel(m)} <span class="num">${mDays.length} día${mDays.length===1?'':'s'} · ${fmtHM(mHours)}</span></h2></div>
+          <div class="section-note" style="margin-bottom:10px;">Días: <strong style="color:var(--ink);">${dayNums}</strong></div>
+          ${mDays.map(dayBlockHtml).join('')}`;
+      }).join('');
+  content.innerHTML = `
+    <div class="sheet-handle"></div>
+    <h3 style="display:flex;align-items:center;gap:8px;"><span style="width:12px;height:12px;border-radius:4px;background:${task.color};display:inline-block;"></span>${task.name}</h3>
+    <div class="card" style="margin-bottom:16px;display:flex;justify-content:space-between;gap:10px;font-size:12.5px;color:var(--muted);">
+      <span>${label}</span>
+      <span><strong style="color:var(--ink);font-family:'IBM Plex Mono',monospace;">${days.length} día${days.length===1?'':'s'} · ${entries.length}× · ${fmtHM(totalHours)}</strong></span>
+    </div>
+    ${body}
+    <div class="sheet-actions" style="margin-top:6px;"><button class="btn-secondary" id="closeTaskDaysBtn" style="flex:1;">Cerrar</button></div>
+  `;
+  document.getElementById('closeTaskDaysBtn').addEventListener('click', closeSheet);
+  overlay.classList.add('open');
+}
+
 /* ---- sheet: usages consumed on a given "used" day (across possibly several source days) ---- */
 function openSpentDaySheet(usedDate){
   const overlay = document.getElementById('sheetOverlay');
@@ -1372,13 +1436,13 @@ function openSpentDaySheet(usedDate){
 
   function draw(){
     const usages = state.extraUsages.filter(u=>u.usedDate===usedDate);
-    const total = usages.reduce((s,u)=>s+u.hours,0);
+    const total = usages.reduce((s,u)=>s+usageEnjoyed(u),0);
     const rows = usages.length===0
       ? `<div class="section-note" style="margin-bottom:14px;">No queda ningún gasto anotado en este día.</div>`
       : `<div class="log-table" style="margin-bottom:14px;">${usages.map(u=>`
           <div class="log-row" style="grid-template-columns:1fr 70px 26px;cursor:default;">
-            <div class="log-task"><span class="name">De ${shortDateLabel(u.sourceDate)}${u.note?' · '+u.note:''}</span></div>
-            <div class="log-dur">-${fmtHM(u.hours)}</div>
+            <div class="log-task"><span class="name">De ${shortDateLabel(u.sourceDate)}${u.factor>1?' · '+fmtHM(u.hours)+' festivas (×'+u.factor+')':''}${u.note?' · '+u.note:''}</span></div>
+            <div class="log-dur">-${fmtHM(usageEnjoyed(u))}</div>
             <button class="icon-btn" data-delusage2="${u.id}">✕</button>
           </div>`).join('')}</div>`;
     content.innerHTML = `
@@ -1439,7 +1503,7 @@ function openDayDetailSheet(sourceDate){
   function festiveBlockHtml(){
     return isHoliday(sourceDate)
       ? `<div class="card" style="margin-bottom:14px;display:flex;justify-content:space-between;align-items:center;gap:10px;">
-           <span style="font-size:12.5px;">🎉 <strong>Festivo</strong> · ${holidayName(sourceDate)}<br><span style="color:var(--muted);font-size:11px;">Todo lo trabajado cuenta como extra festiva, sin descontar nada.</span></span>
+           <span style="font-size:12.5px;">🎉 <strong>Festivo</strong> · ${holidayName(sourceDate)}<br><span style="color:var(--muted);font-size:11px;">Todo lo trabajado cuenta como extra; la pausa cuenta si pasas de 6 horas.</span></span>
            <button type="button" class="link-btn" id="sheetToggleFestBtn">Quitar festivo</button>
          </div>`
       : `<div style="margin-bottom:14px;"><button type="button" class="link-btn" id="sheetToggleFestBtn">🎉 Marcar este día como festivo</button></div>`;
@@ -1456,7 +1520,7 @@ function openDayDetailSheet(sourceDate){
     if(usages.length===0) return `<div class="section-note" style="margin-bottom:12px;">Aún no has gastado nada de este día.</div>`;
     return `<div class="log-table" style="margin-bottom:12px;">${usages.map(u=>`
       <div class="log-row" style="grid-template-columns:1fr 70px 26px;cursor:default;">
-        <div class="log-task"><span class="name">${shortDateLabel(u.usedDate)}${u.note?' · '+u.note:''}</span></div>
+        <div class="log-task"><span class="name">${shortDateLabel(u.usedDate)}${u.factor>1?' · '+fmtHM(usageEnjoyed(u))+' disfrutadas (×'+u.factor+')':''}${u.note?' · '+u.note:''}</span></div>
         <div class="log-dur">-${fmtHM(u.hours)}</div>
         <button class="icon-btn" data-delusage="${u.id}" style="text-align:right;">✕</button>
       </div>`).join('')}</div>`;
@@ -1490,6 +1554,12 @@ function openDayDetailSheet(sourceDate){
             </div>
           </div>
         </div>
+        ${isHoliday(sourceDate) ? `
+        <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:12.5px;">
+          <input type="checkbox" id="usageEquivInput" checked style="width:auto;margin:0;">
+          Equivalencia festiva: 1 hora festiva = ${FESTIVE_EQUIVALENCE} normales
+        </label>
+        <div id="usageEquivHint" style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--accent-dark);margin-bottom:10px;"></div>` : ''}
         <div class="form-field" style="margin-bottom:10px;">
           <span style="font-family:'IBM Plex Mono',monospace;font-size:9.5px;color:var(--muted);display:block;margin-bottom:3px;">OBSERVACIÓN (OPCIONAL)</span>
           <input type="text" id="usageNoteInput" placeholder="Ej. cita médica, gestión personal…">
@@ -1511,7 +1581,12 @@ function openDayDetailSheet(sourceDate){
     function updateRemainingDisplay(){
       const h = parseInt(document.getElementById('usageHoursInput').value, 10) || 0;
       const m = parseInt(document.getElementById('usageMinutesInput').value, 10) || 0;
-      const pending = h + (m/60);
+      const enjoyedNow = h + (m/60);
+      const equivEl = document.getElementById('usageEquivInput');
+      const factor = (equivEl && equivEl.checked) ? FESTIVE_EQUIVALENCE : 1;
+      const pending = enjoyedNow / factor;
+      const hintEl = document.getElementById('usageEquivHint');
+      if(hintEl) hintEl.textContent = (factor>1 && enjoyedNow>0) ? `Descuenta ${fmtHM(pending)} de tus extras festivas` : '';
       const rawExtra = rawExtraFor(sourceDate);
       const alreadySpent = totalSpentFromSource(sourceDate);
       const remaining = rawExtra - alreadySpent - pending;
@@ -1521,6 +1596,7 @@ function openDayDetailSheet(sourceDate){
     }
     document.getElementById('usageHoursInput').addEventListener('input', updateRemainingDisplay);
     document.getElementById('usageMinutesInput').addEventListener('input', updateRemainingDisplay);
+    document.getElementById('usageEquivInput')?.addEventListener('change', updateRemainingDisplay);
     content.querySelectorAll('[data-edit]').forEach(el=>{
       el.addEventListener('click', ()=>{
         const entry = state.entries.find(x=>x.id===el.dataset.edit);
@@ -1539,10 +1615,13 @@ function openDayDetailSheet(sourceDate){
       const usedDate = document.getElementById('usageDateInput').value || todayStr();
       const h = parseInt(document.getElementById('usageHoursInput').value, 10) || 0;
       const m = parseInt(document.getElementById('usageMinutesInput').value, 10) || 0;
-      const hours = h + (m/60);
+      const enjoyed = h + (m/60);
+      const equivEl = document.getElementById('usageEquivInput');
+      const factor = (equivEl && equivEl.checked) ? FESTIVE_EQUIVALENCE : 1;
+      const hours = enjoyed / factor; // what leaves the source day's extra pool
       const note = document.getElementById('usageNoteInput').value.trim();
-      if(hours<=0){ showToast('Indica cuántas horas gastas'); return; }
-      addExtraUsage(sourceDate, usedDate, hours, note);
+      if(enjoyed<=0){ showToast('Indica cuántas horas gastas'); return; }
+      addExtraUsage(sourceDate, usedDate, hours, note, enjoyed, factor);
       scheduleSave();
       draw();
       renderContent();
@@ -1783,6 +1862,9 @@ function attachContentHandlers(){
   document.querySelectorAll('[data-daydetail]').forEach(el=>{
     el.addEventListener('click', ()=> openDayDetailSheet(el.dataset.daydetail));
   });
+  document.querySelectorAll('[data-taskdetail]').forEach(el=>{
+    el.addEventListener('click', ()=> openTaskDaysSheet(el.dataset.taskdetail));
+  });
   document.querySelectorAll('[data-spentdaydetail]').forEach(el=>{
     el.addEventListener('click', ()=> openSpentDaySheet(el.dataset.spentdaydetail));
   });
@@ -1795,7 +1877,12 @@ function attachContentHandlers(){
   document.getElementById('historialYearInput')?.addEventListener('change', (e)=>{ historialYearValue = e.target.value; renderContent(); });
 
   document.querySelectorAll('[data-statstype]').forEach(el=>{
-    el.addEventListener('click', ()=>{ statsPeriodType = el.dataset.statstype; renderContent(); });
+    el.addEventListener('click', ()=>{
+      statsPeriodType = el.dataset.statstype;
+      state.settings.statsPeriodType = statsPeriodType; // remembered between sessions
+      scheduleSave();
+      renderContent();
+    });
   });
   document.getElementById('statsDayInput')?.addEventListener('change', (e)=>{ statsDayValue = e.target.value; renderContent(); });
   document.getElementById('statsMonthInput')?.addEventListener('change', (e)=>{ statsMonthValue = e.target.value; renderContent(); });
@@ -2029,6 +2116,8 @@ window.addEventListener('afterprint', ()=>{
 /* ============ INIT ============ */
 (async function init(){
   await loadState();
+  // Estadísticas opens on the last period the person chose ("Todo" by default)
+  statsPeriodType = (state.settings && state.settings.statsPeriodType) || 'all';
   render();
 })();
 </script>
